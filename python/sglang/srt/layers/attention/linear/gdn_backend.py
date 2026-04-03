@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, use_intel_xpu_backend
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -48,6 +48,17 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+elif use_intel_xpu_backend():
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn as causal_conv1d_fn_xpu,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_update as causal_conv1d_update_xpu,
+    )
+    from sgl_kernel.mamba import (fused_gdn_gating as fused_gdn_gating_xpu)
+    causal_conv1d_fn = causal_conv1d_fn_xpu
+    causal_conv1d_update = causal_conv1d_update_xpu
+    fused_gdn_gating = fused_gdn_gating_xpu
 
 
 class GDNKernelDispatcher:
@@ -247,7 +258,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        if not is_cpu() and not is_npu():
+        if not is_cpu() and not is_npu() and not use_intel_xpu_backend():
             assert (
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -458,7 +469,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if (is_npu() or is_cpu() or use_intel_xpu_backend()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

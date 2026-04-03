@@ -3,7 +3,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_npu, use_intel_xpu_backend
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -29,12 +29,18 @@ elif is_cpu():
     fused_sigmoid_gating_delta_rule_update = (
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
+elif use_intel_xpu_backend():
+    from sgl_kernel.mamba import (chunk_gated_delta_rule as chunk_gated_delta_rule_xpu)
+    from sgl_kernel.mamba import (fused_sigmoid_gating_delta_rule_update as fused_sigmoid_gating_delta_rule_update_xpu)
+    chunk_gated_delta_rule = chunk_gated_delta_rule_xpu
+    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_xpu
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
-    supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_packed_decode: bool = not is_cpu() and not is_npu() and not use_intel_xpu_backend()
+    # supports_packed_decode: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -137,7 +143,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu() or is_cpu():
+        # if is_npu() or is_cpu():
+        if is_npu() or is_cpu() or use_intel_xpu_backend():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
         return chunk_gated_delta_rule(
