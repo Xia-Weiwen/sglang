@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -12,6 +12,14 @@ from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
+
+
+def _xpu_hc_ok(*tensors: torch.Tensor, rank2: Tuple[torch.Tensor, ...] = ()) -> bool:
+    # sgl_kernel hc_* ops: contiguous bf16 XPU tensors; `rank2` must also be 2D.
+    return all(
+        t.is_xpu and t.dtype == torch.bfloat16 and t.is_contiguous()
+        for t in (*tensors, *rank2)
+    ) and all(t.dim() == 2 for t in rank2)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -51,7 +59,7 @@ class GroupedGemmaRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and (x.is_cuda or x.is_xpu)
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -289,6 +297,20 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif _xpu_hc_ok(
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            rank2=(hyper_input_normed,),
+        ):
+            from sgl_kernel import hc_gate_mix, hc_silu
+
+            hidden = F.linear(hyper_input_normed, self.input_mix_weight_down.weight)
+            gate = F.linear(
+                hc_silu(hidden, self.hc_count), self.input_mix_weight_up.weight
+            )
+            mixed_input = hc_gate_mix(hyper_input_normed, gate, self.hc_count).to(
+                self.params_dtype
+            )
         else:
             mixed_input = self._mix_compute(
                 hyper_input_normed,
@@ -326,7 +348,7 @@ class GatedResidual(HyperConnectionBase):
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
-        hyper_input, _, partials = residuals
+        hyper_input, hyper_input_normed, partials = residuals
         if (
             partials is not None
             and next_norm is not None
@@ -347,6 +369,27 @@ class GatedResidual(HyperConnectionBase):
                 partials,
                 next_norm.weight,
                 next_norm.variance_epsilon,
+            )
+        if (
+            next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.numel()
+            in (self.hidden_size, self.hc_count * self.hidden_size)
+            and _xpu_hc_ok(
+                self.block_inject_weight.weight,
+                next_norm.weight,
+                rank2=(block_output, hyper_input, hyper_input_normed),
+            )
+        ):
+            from sgl_kernel import hc_combine_norm
+
+            return hc_combine_norm(
+                hyper_input,
+                block_output,
+                F.linear(hyper_input_normed, self.block_inject_weight.weight),
+                next_norm.weight,
+                next_norm.variance_epsilon,
+                self.hc_count,
             )
         return self.combine(block_output, residuals), None
 
@@ -401,6 +444,19 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             )
+
+        if _xpu_hc_ok(
+            self.block_inject_weight.weight,
+            rank2=(block_output, hyper_input, hyper_input_normed),
+        ):
+            from sgl_kernel import hc_combine
+
+            return hc_combine(
+                hyper_input,
+                block_output,
+                F.linear(hyper_input_normed, self.block_inject_weight.weight),
+                self.hc_count,
+            ).to(self.params_dtype)
 
         updated_residuals = self._combine_compute(
             block_output,

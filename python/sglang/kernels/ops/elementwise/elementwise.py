@@ -68,7 +68,23 @@ def fused_sigmoid_mul(
     Supports strided gate: if gate is 3D (num_tokens, num_heads, head_dim)
     and attn_output is 2D (num_tokens, hidden_dim), the kernel reads gate
     via explicit strides without requiring a contiguous copy.
+
+    On XPU the non-quant path runs the SYCL kernel from sgl_kernel, which is
+    faster than Triton there.
     """
+    if (
+        attn_output.is_xpu
+        and not quant
+        and attn_output.ndim == 2
+        and attn_output.is_contiguous()
+        and attn_output.dtype in (torch.bfloat16, torch.float16)
+        and gate.dtype == attn_output.dtype
+        and gate.ndim in (2, 3)
+        and gate.stride(-1) == 1
+    ):
+        from sgl_kernel import fused_sigmoid_mul as xpu_fused_sigmoid_mul
+
+        return xpu_fused_sigmoid_mul(attn_output, gate, inplace=inplace)
     if gate.ndim == 3 and attn_output.ndim == 2:
         # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
         num_tokens, num_heads, head_dim = gate.shape
